@@ -144,6 +144,33 @@ async function generateHuggingFaceEmbedding(text) {
 }
 
 /**
+ * Get the embedding column name for a table
+ */
+async function getEmbeddingColumnName(tableName) {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name = $1 
+      AND table_schema = 'public'
+      AND (column_name LIKE '%embedding%' OR data_type = 'USER-DEFINED')
+      ORDER BY 
+        CASE 
+          WHEN column_name = 'embedding' THEN 1
+          WHEN column_name = 'content_embedding' THEN 2
+          ELSE 3
+        END
+      LIMIT 1
+    `, [tableName]);
+    
+    return result.rows[0]?.column_name || 'embedding';
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * Perform vector similarity search
  */
 async function vectorSearch(query, table = 'document_embeddings', limit = 5, similarityThreshold = 0.5) {
@@ -152,17 +179,20 @@ async function vectorSearch(query, table = 'document_embeddings', limit = 5, sim
     // Generate embedding for the query
     const queryEmbedding = await generateEmbedding(query);
     
+    // Get the correct embedding column name for this table
+    const embeddingColumn = await getEmbeddingColumnName(table);
+    
     // Perform cosine similarity search
     const sqlQuery = `
       SELECT 
         id,
         content,
         metadata,
-        1 - (embedding <=> $1::vector) as similarity,
+        1 - (${embeddingColumn} <=> $1::vector) as similarity,
         created_at
       FROM ${table}
-      WHERE 1 - (embedding <=> $1::vector) > $2
-      ORDER BY embedding <=> $1::vector
+      WHERE 1 - (${embeddingColumn} <=> $1::vector) > $2
+      ORDER BY ${embeddingColumn} <=> $1::vector
       LIMIT $3
     `;
     
@@ -214,6 +244,105 @@ async function metadataSearch(filters = {}, table = 'document_embeddings', limit
     
     const result = await client.query(sqlQuery, params);
     return result.rows;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Get detailed table schemas and column information
+ */
+async function getTableSchemas() {
+  const client = await pool.connect();
+  try {
+    // Get all tables with their columns
+    const tablesQuery = `
+      SELECT 
+        t.table_name,
+        c.column_name,
+        c.data_type,
+        c.is_nullable,
+        c.column_default,
+        c.udt_name,
+        c.character_maximum_length
+      FROM information_schema.tables t
+      LEFT JOIN information_schema.columns c ON t.table_name = c.table_name
+      WHERE t.table_schema = 'public' 
+      AND t.table_type = 'BASE TABLE'
+      ORDER BY t.table_name, c.ordinal_position;
+    `;
+    
+    const result = await client.query(tablesQuery);
+    const tables = {};
+    
+    // Group columns by table
+    result.rows.forEach(row => {
+      if (!tables[row.table_name]) {
+        tables[row.table_name] = {
+          name: row.table_name,
+          columns: [],
+          embeddingColumns: [],
+          vectorDimensions: {},
+          rowCount: 0
+        };
+      }
+      
+      if (row.column_name) {
+        const column = {
+          name: row.column_name,
+          type: row.data_type,
+          nullable: row.is_nullable === 'YES',
+          default: row.column_default,
+          udtName: row.udt_name,
+          maxLength: row.character_maximum_length
+        };
+        
+        tables[row.table_name].columns.push(column);
+        
+        // Detect embedding columns
+        if (row.column_name.includes('embedding') && row.udt_name === 'vector') {
+          tables[row.table_name].embeddingColumns.push(row.column_name);
+        }
+      }
+    });
+    
+    // Get row counts and vector dimensions
+    for (const tableName of Object.keys(tables)) {
+      try {
+        // Get row count
+        const countResult = await client.query(`SELECT COUNT(*) as count FROM "${tableName}"`);
+        tables[tableName].rowCount = parseInt(countResult.rows[0].count);
+        
+        // Get vector dimensions for embedding columns
+        for (const embeddingCol of tables[tableName].embeddingColumns) {
+          try {
+            const sampleResult = await client.query(
+              `SELECT array_length(${embeddingCol}::real[], 1) as dimensions 
+               FROM "${tableName}" 
+               WHERE ${embeddingCol} IS NOT NULL 
+               LIMIT 1`
+            );
+            if (sampleResult.rows[0]?.dimensions) {
+              tables[tableName].vectorDimensions[embeddingCol] = sampleResult.rows[0].dimensions;
+            }
+          } catch (e) {
+            tables[tableName].vectorDimensions[embeddingCol] = 'unknown';
+          }
+        }
+      } catch (e) {
+        tables[tableName].rowCount = 0;
+      }
+    }
+    
+    return {
+      tables: Object.values(tables),
+      usage: {
+        vectorSearch: "Use vector_search on tables with embedding columns for semantic similarity",
+        metadataSearch: "Use metadata_search on tables with metadata/jsonb columns for filtering",
+        insertDocument: "Use insert_document to add new content with automatic embeddings",
+        tableParameter: "Specify 'table' parameter to target specific tables in queries"
+      }
+    };
   } finally {
     client.release();
   }
@@ -273,8 +402,11 @@ async function insertDocument(content, metadata = {}, table = 'document_embeddin
     // Generate embedding
     const embedding = await generateEmbedding(content);
     
+    // Get the correct embedding column name for this table
+    const embeddingColumn = await getEmbeddingColumnName(table);
+    
     const query = `
-      INSERT INTO ${table} (content, metadata, embedding, created_at)
+      INSERT INTO ${table} (content, metadata, ${embeddingColumn}, created_at)
       VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
       RETURNING id
     `;
@@ -410,6 +542,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       required: []
     }
   });
+  
+  tools.push({
+    name: "get_table_schemas",
+    description: "Get detailed schemas and column information for all tables in the database",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: []
+    }
+  });
       
   return { tools };
 });
@@ -490,6 +632,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
       
+      case "get_table_schemas": {
+        const schemas = await getTableSchemas();
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Database Table Schemas:\n\n` +
+                    schemas.tables.map(table => {
+                      let tableInfo = `## ${table.name} (${table.rowCount} rows)\n`;
+                      
+                      // Embedding columns info
+                      if (table.embeddingColumns.length > 0) {
+                        tableInfo += `📊 Embedding Columns: ${table.embeddingColumns.join(', ')}\n`;
+                        table.embeddingColumns.forEach(col => {
+                          const dims = table.vectorDimensions[col];
+                          tableInfo += `   - ${col}: ${dims} dimensions\n`;
+                        });
+                      }
+                      
+                      // All columns
+                      tableInfo += `\nColumns:\n`;
+                      table.columns.forEach(col => {
+                        const nullable = col.nullable ? ' (nullable)' : ' (required)';
+                        const defaultVal = col.default ? ` [default: ${col.default}]` : '';
+                        tableInfo += `   - ${col.name}: ${col.type}${nullable}${defaultVal}\n`;
+                      });
+                      
+                      return tableInfo;
+                    }).join('\n') +
+                    `\n${schemas.usage.vectorSearch}\n` +
+                    `${schemas.usage.metadataSearch}\n` +
+                    `${schemas.usage.insertDocument}\n` +
+                    `${schemas.usage.tableParameter}`
+            }
+          ]
+        };
+      }
+      
       case "insert_document": {
         if (embeddingProvider === "none") {
           throw new McpError(
@@ -534,7 +715,10 @@ async function main() {
   await server.connect(transport);
   console.error(`🚀 MCP PGVector Server started successfully`);
   console.error(`📊 Database: ${CONFIG.db.connectionString.split('@')[1]?.split('/')[0] || 'connected'}`);
-  console.error(`🔧 Tools: vector_search, metadata_search, get_database_stats, insert_document`);
+  const availableTools = embeddingProvider === "none" 
+    ? "metadata_search, get_database_stats, get_table_schemas"
+    : "vector_search, metadata_search, get_database_stats, get_table_schemas, insert_document";
+  console.error(`🔧 Tools: ${availableTools}`);
 }
 
 main().catch((error) => {
