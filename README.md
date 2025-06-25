@@ -1,8 +1,17 @@
 # MCP PGVector Server
+[![smithery badge](https://smithery.ai/badge/@yusufferdogan/mcp-pgvector-server)](https://smithery.ai/server/@yusufferdogan/mcp-pgvector-server)
 
 A Model Context Protocol (MCP) server that provides semantic search capabilities for PostgreSQL databases using pgvector extensions. Supports multiple embedding providers including Azure OpenAI and Hugging Face.
 
 ## 🚀 Quick Start
+
+### Installing via Smithery
+
+To install PGVector Semantic Search Server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@yusufferdogan/mcp-pgvector-server):
+
+```bash
+npx -y @smithery/cli install @yusufferdogan/mcp-pgvector-server --client claude
+```
 
 ### Using npx (Recommended)
 
