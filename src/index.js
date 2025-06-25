@@ -39,9 +39,13 @@ const CONFIG = {
   }
 };
 
-// Validate required environment variables
-if (!CONFIG.db.connectionString) {
+// Check for health check mode
+const isHealthCheck = process.argv.includes('--health') || process.env.HEALTH_CHECK === 'true';
+
+// Validate required environment variables (skip for health check)
+if (!CONFIG.db.connectionString && !isHealthCheck) {
   console.error('ERROR: DATABASE_URL environment variable is required');
+  console.error('For health checks, use --health flag or set HEALTH_CHECK=true');
   process.exit(1);
 }
 
@@ -73,20 +77,51 @@ if (embeddingProvider === "huggingface") {
 
 console.error(`🔧 Embedding provider: ${embeddingProvider}`);
 
-// Initialize PostgreSQL connection
-const pool = new Pool({
-  connectionString: CONFIG.db.connectionString,
-});
+// Initialize PostgreSQL connection (lazy initialization)
+let pool = null;
+let dbConnectionStatus = 'not_attempted';
 
-// Test database connection
-try {
-  const client = await pool.connect();
-  await client.query('SELECT 1');
-  client.release();
-  console.error('✅ Database connected successfully');
-} catch (error) {
-  console.error('❌ Database connection failed:', error.message);
-  process.exit(1);
+async function initializeDatabase() {
+  if (isHealthCheck) {
+    console.error('🏥 Health check mode - skipping database connection');
+    dbConnectionStatus = 'skipped_health_check';
+    return;
+  }
+  
+  if (!CONFIG.db.connectionString) {
+    console.error('⚠️  No DATABASE_URL provided - running in connection-less mode');
+    dbConnectionStatus = 'no_url';
+    return;
+  }
+
+  try {
+    pool = new Pool({
+      connectionString: CONFIG.db.connectionString,
+    });
+    
+    const client = await pool.connect();
+    await client.query('SELECT 1');
+    client.release();
+    console.error('✅ Database connected successfully');
+    dbConnectionStatus = 'connected';
+  } catch (error) {
+    console.error('❌ Database connection failed:', error.message);
+    console.error('🔄 Server will continue in limited mode (schema tools disabled)');
+    dbConnectionStatus = 'failed';
+    pool = null;
+  }
+}
+
+async function ensurePoolConnection() {
+  if (dbConnectionStatus === 'not_attempted') {
+    await initializeDatabase();
+  }
+  
+  if (!pool) {
+    throw new Error('Database connection not available. Please check DATABASE_URL and ensure PostgreSQL is accessible.');
+  }
+  
+  return pool;
 }
 
 /**
@@ -147,7 +182,8 @@ async function generateHuggingFaceEmbedding(text) {
  * Get the embedding column name for a table
  */
 async function getEmbeddingColumnName(tableName) {
-  const client = await pool.connect();
+  const currentPool = await ensurePoolConnection();
+  const client = await currentPool.connect();
   try {
     const result = await client.query(`
       SELECT column_name 
@@ -174,7 +210,8 @@ async function getEmbeddingColumnName(tableName) {
  * Perform vector similarity search
  */
 async function vectorSearch(query, table = 'document_embeddings', limit = 5, similarityThreshold = 0.5) {
-  const client = await pool.connect();
+  const currentPool = await ensurePoolConnection();
+  const client = await currentPool.connect();
   try {
     // Generate embedding for the query
     const queryEmbedding = await generateEmbedding(query);
@@ -212,7 +249,8 @@ async function vectorSearch(query, table = 'document_embeddings', limit = 5, sim
  * Search by metadata filters
  */
 async function metadataSearch(filters = {}, table = 'document_embeddings', limit = 10) {
-  const client = await pool.connect();
+  const currentPool = await ensurePoolConnection();
+  const client = await currentPool.connect();
   try {
     let whereConditions = [];
     let params = [];
@@ -253,7 +291,8 @@ async function metadataSearch(filters = {}, table = 'document_embeddings', limit
  * Get detailed table schemas and column information
  */
 async function getTableSchemas() {
-  const client = await pool.connect();
+  const currentPool = await ensurePoolConnection();
+  const client = await currentPool.connect();
   try {
     // Get all tables with their columns
     const tablesQuery = `
@@ -352,7 +391,8 @@ async function getTableSchemas() {
  * Get database statistics
  */
 async function getDatabaseStats() {
-  const client = await pool.connect();
+  const currentPool = await ensurePoolConnection();
+  const client = await currentPool.connect();
   try {
     // Get all tables with vector columns
     const tablesQuery = `
@@ -397,7 +437,8 @@ async function getDatabaseStats() {
  * Insert document with embedding
  */
 async function insertDocument(content, metadata = {}, table = 'document_embeddings') {
-  const client = await pool.connect();
+  const currentPool = await ensurePoolConnection();
+  const client = await currentPool.connect();
   try {
     // Generate embedding
     const embedding = await generateEmbedding(content);
@@ -552,6 +593,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       required: []
     }
   });
+  
+  // Always add status check tool
+  tools.push({
+    name: "status_check",
+    description: "Check server status, database connectivity, and available functionality",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: []
+    }
+  });
       
   return { tools };
 });
@@ -695,6 +747,65 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
       
+      case "status_check": {
+        const status = {
+          server: "MCP PGVector Server",
+          version: CONFIG.server.version,
+          embeddingProvider: embeddingProvider,
+          database: {
+            status: dbConnectionStatus,
+            hasConnection: dbConnectionStatus === 'connected',
+            connectionString: CONFIG.db.connectionString ? 
+              `${CONFIG.db.connectionString.split('@')[1]?.split('/')[0] || 'configured'}` : 'not configured'
+          },
+          availableTools: [],
+          limitations: []
+        };
+        
+        // Determine available functionality
+        if (dbConnectionStatus === 'connected') {
+          if (embeddingProvider !== "none") {
+            status.availableTools = ["vector_search", "metadata_search", "get_database_stats", "get_table_schemas", "insert_document"];
+          } else {
+            status.availableTools = ["metadata_search", "get_database_stats", "get_table_schemas"];
+            status.limitations.push("Vector search disabled - no embedding provider configured");
+          }
+        } else {
+          status.availableTools = ["status_check"];
+          status.limitations.push("Database tools disabled - no database connection");
+          
+          if (dbConnectionStatus === 'no_url') {
+            status.limitations.push("Set DATABASE_URL environment variable to enable database features");
+          } else if (dbConnectionStatus === 'failed') {
+            status.limitations.push("Database connection failed - check connectivity and credentials");
+          } else if (dbConnectionStatus === 'skipped_health_check') {
+            status.limitations.push("Health check mode - database connection skipped");
+          }
+        }
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Server Status Report:
+
+🚀 Server: ${status.server} v${status.version}
+🔧 Embedding Provider: ${status.embeddingProvider}
+
+📊 Database Status: ${status.database.status}
+🔗 Connection: ${status.database.connectionString}
+✅ Connected: ${status.database.hasConnection ? 'Yes' : 'No'}
+
+🛠️  Available Tools: ${status.availableTools.join(', ')}
+
+${status.limitations.length > 0 ? '⚠️  Limitations:\n' + status.limitations.map(l => `   - ${l}`).join('\n') : '✅ All features available'}
+
+${isHealthCheck ? '\n🏥 Running in health check mode' : ''}`
+            }
+          ]
+        };
+      }
+      
       default:
         throw new McpError(
           ErrorCode.MethodNotFound,
@@ -711,14 +822,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // Start the server
 async function main() {
+  // Initialize database connection (lazy)
+  await initializeDatabase();
+  
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(`🚀 MCP PGVector Server started successfully`);
-  console.error(`📊 Database: ${CONFIG.db.connectionString.split('@')[1]?.split('/')[0] || 'connected'}`);
-  const availableTools = embeddingProvider === "none" 
-    ? "metadata_search, get_database_stats, get_table_schemas"
-    : "vector_search, metadata_search, get_database_stats, get_table_schemas, insert_document";
-  console.error(`🔧 Tools: ${availableTools}`);
+  
+  // Database status reporting
+  const dbStatus = {
+    'connected': CONFIG.db.connectionString?.split('@')[1]?.split('/')[0] || 'connected',
+    'failed': 'connection failed - limited mode',
+    'no_url': 'no DATABASE_URL - limited mode', 
+    'skipped_health_check': 'health check mode',
+    'not_attempted': 'not initialized'
+  };
+  console.error(`📊 Database: ${dbStatus[dbConnectionStatus] || dbConnectionStatus}`);
+  
+  // Dynamic tool list based on database availability
+  let availableTools = [];
+  if (dbConnectionStatus === 'connected') {
+    if (embeddingProvider !== "none") {
+      availableTools = ["vector_search", "metadata_search", "get_database_stats", "get_table_schemas", "insert_document"];
+    } else {
+      availableTools = ["metadata_search", "get_database_stats", "get_table_schemas"];
+    }
+  } else {
+    availableTools = ["status_check"];
+  }
+  
+  console.error(`🔧 Tools: ${availableTools.join(', ')}`);
 }
 
 main().catch((error) => {

@@ -22,10 +22,12 @@ Usage:
 Options:
   --help, -h          Show this help message
   --version, -v       Show version
+  --health            Health check mode (no database required)
   --config <file>     Path to config file (optional)
 
 Environment Variables:
-  DATABASE_URL        PostgreSQL connection string (required)
+  DATABASE_URL        PostgreSQL connection string (optional for health checks)
+  HEALTH_CHECK        Set to 'true' for health check mode
   
   Embedding Providers (choose one, or none for metadata-only mode):
   AZURE_OPENAI_API_KEY           Azure OpenAI API key (optional)
